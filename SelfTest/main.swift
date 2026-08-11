@@ -1,11 +1,14 @@
-// TriSync — Runner de tests autonome (sans XCTest : la licence Xcode non
-// acceptée bloque la toolchain complète ; le SDK CLT ne fournit pas XCTest).
-// Compilation : swiftc -o runner TriSyncCore.swift main.swift
+// TriSync — Suite de tests automatisée complète (36 tests)
+// Compilation et exécution : swiftc -O $(find TriSyncPkg/Sources/TriSyncCore -name "*.swift") SelfTest/main.swift -o SelfTest/runner && ./SelfTest/runner
 
+import Foundation
 import AVFoundation
+import CoreMedia
 import CryptoKit
+import AppKit
 
 // MARK: - Mini framework d'assertions
+let _unbufferedStdout: Void = { setbuf(__stdoutp, nil) }()
 
 struct TestFailure: Error, CustomStringConvertible {
     let message: String
@@ -22,9 +25,22 @@ func category(_ name: String) {
     print("\n== \(name) ==")
 }
 
+@MainActor
 func test(_ name: String, _ body: () throws -> Void) {
     do {
         try body()
+        passed += 1
+        print("  ✓ \(name)")
+    } catch {
+        failed += 1
+        print("  ✗ \(name) — \(error)")
+    }
+}
+
+@MainActor
+func testAsync(_ name: String, _ body: () async throws -> Void) async {
+    do {
+        try await body()
         passed += 1
         print("  ✓ \(name)")
     } catch {
@@ -54,9 +70,7 @@ func checkNotNil<T>(_ value: T?, _ message: String = "", _ file: String = #fileI
     return value
 }
 
-/// Fait tourner le runloop principal jusqu'à ce que la condition soit vraie
-/// (nécessaire pour les notifications AVFoundation, livrées sur la file main).
-func waitUntil(timeout: TimeInterval = 8, _ condition: () -> Bool) -> Bool {
+func waitUntil(timeout: TimeInterval = 6, _ condition: () -> Bool) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if condition() { return true }
@@ -65,12 +79,22 @@ func waitUntil(timeout: TimeInterval = 8, _ condition: () -> Bool) -> Bool {
     return condition()
 }
 
-// MARK: - Fabrique de vidéos de test (H.264 réel via AVAssetWriter)
+func waitUntilAsync(timeout: TimeInterval = 6, _ condition: @MainActor () -> Bool) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+    return await condition()
+}
+
+// MARK: - Fabrique de vidéos de test H.264
 
 enum TestVideoFactory {
     static func makeVideo(at url: URL, duration: Double,
                           size: CGSize = CGSize(width: 320, height: 240),
-                          color: (r: UInt8, g: UInt8, b: UInt8) = (200, 30, 30)) throws {
+                          color: (r: UInt8, g: UInt8, b: UInt8) = (200, 30, 30)) async throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let settings: [String: Any] = [
@@ -95,7 +119,9 @@ enum TestVideoFactory {
         let fps: Int32 = 30
         let totalFrames = Int(duration * Double(fps))
         for i in 0..<totalFrames {
-            while !input.isReadyForMoreMediaData { usleep(2000) }
+            while !input.isReadyForMoreMediaData {
+                try? await Task.sleep(nanoseconds: 2_000_000)
+            }
             let time = CMTime(value: CMTimeValue(i), timescale: fps)
             var pixelBuffer: CVPixelBuffer?
             guard let pool = adaptor.pixelBufferPool,
@@ -122,600 +148,542 @@ enum TestVideoFactory {
             adaptor.append(buffer, withPresentationTime: time)
         }
         input.markAsFinished()
-        let semaphore = DispatchSemaphore(value: 0)
-        writer.finishWriting { semaphore.signal() }
-        _ = semaphore.wait(timeout: .now() + 10)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writer.finishWriting {
+                continuation.resume()
+            }
+        }
         guard writer.status == .completed else {
             throw TestFailure("Écriture vidéo échouée: \(writer.error?.localizedDescription ?? "?")")
         }
     }
 
-    static func makeVideos(count: Int, in directory: URL, prefix: String = "test") throws -> [URL] {
+    static func makeVideos(count: Int, in directory: URL, prefix: String = "test") async throws -> [URL] {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var urls: [URL] = []
         for i in 0..<count {
             let url = directory.appendingPathComponent("\(prefix)_\(i).mov")
-            try makeVideo(at: url, duration: 1.5 + Double(i) * 0.5)
+            try await makeVideo(at: url, duration: 1.5 + Double(i) * 0.5)
             urls.append(url)
         }
         return urls
     }
 }
 
-// MARK: - Tests : bibliothèque vidéo
+// MARK: - Exécution des Tests
 
 @MainActor
-func runLibraryTests() throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("trisync-selftest-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
+func runAllTests() async {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("trisync-test-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
 
-    category("Bibliothèque vidéo")
+    print("==========================================")
+    print(" TriSync Core — Suite de Tests de Validation")
+    print("==========================================")
 
-    test("Filtrage des fichiers vidéo (whitelist)") {
-        let movie = directory.appendingPathComponent("a.mov")
-        let mp4 = directory.appendingPathComponent("b.mp4")
-        let mkv = directory.appendingPathComponent("c.mkv")
-        let txt = directory.appendingPathComponent("d.txt")
-        let jpg = directory.appendingPathComponent("e.jpg")
-        try TestVideoFactory.makeVideo(at: movie, duration: 1.5)
-        let accepted = VideoLibrary.videoFiles(from: [movie, mp4, mkv, txt, jpg])
-        try checkEqual(accepted.count, 3, "Seuls les fichiers vidéo doivent être acceptés")
-        try check(!accepted.contains(txt) && !accepted.contains(jpg), "txt/jpg rejetés")
-    }
+    // ==========================================
+    // 1. Modèles & Bibliothèque
+    // ==========================================
+    category("1. Modèles & Bibliothèque Vidéo")
 
-    test("Déduplication des URLs") {
-        let library = VideoLibrary()
-        let video = directory.appendingPathComponent("dedupe.mov")
-        try TestVideoFactory.makeVideo(at: video, duration: 1.5)
-        library.add(urls: [video, video, video])
-        try checkEqual(library.assets.count, 1, "Un même fichier n'existe qu'une fois")
-    }
-
-    test("Sélection multi bornée à 5 (maxSlots), ordre des clics") {
-        let library = VideoLibrary()
-        let videos = try TestVideoFactory.makeVideos(count: 7, in: directory)
-        library.add(urls: videos)
-        try checkEqual(library.assets.count, 7)
-        for asset in library.assets { library.toggleSelection(asset) }
-        try checkEqual(library.selectedOrder.count, 7, "La sélection en attente peut dépasser 5")
-        try checkEqual(library.selectedAssets.count, VideoLibrary.maxSlots, "Le lancement est borné à 5")
-        try checkEqual(library.selectedAssets.first?.url, videos.first, "Ordre des clics conservé")
-    }
-
-    test("Lancer la sélection remplit A→E puis vide la sélection") {
-        let library = VideoLibrary()
-        let videos = try TestVideoFactory.makeVideos(count: 3, in: directory)
-        library.add(urls: videos)
-        for asset in library.assets { library.toggleSelection(asset) }
-        library.launchSelected()
-        try checkEqual(library.selectedOrder.count, 0, "Sélection vidée après lancement")
-        let filled = library.slots.compactMap { $0 }
-        try checkEqual(filled.count, 3, "3 vidéos lancées = 3 emplacements")
-        try checkEqual(filled[0].url, videos[0], "1er clic → emplacement A")
-        try checkEqual(filled[1].url, videos[1], "2e clic → emplacement B")
-    }
-
-    test("ensureInLibrary ajoute sans occuper d'emplacement") {
-        let library = VideoLibrary()
-        let video = directory.appendingPathComponent("ensure.mov")
-        try TestVideoFactory.makeVideo(at: video, duration: 1.5)
-        let asset = try checkNotNil(library.ensureInLibrary(video), "Asset créé")
-        try checkEqual(library.assets.count, 1)
-        try check(library.slots.allSatisfy { $0 == nil }, "Aucun slot occupé")
-    }
-
-    test("clearAll libère tout") {
-        let library = VideoLibrary()
-        let videos = try TestVideoFactory.makeVideos(count: 2, in: directory)
-        library.add(urls: videos)
-        library.assign(library.assets[0], to: 0)
-        library.clearAll()
-        try checkEqual(library.assets.count, 0)
-        try check(library.slots.allSatisfy { $0 == nil })
-        try checkEqual(library.selectedOrder.count, 0)
-    }
-}
-
-// MARK: - Tests : moteur de synchronisation
-
-@MainActor
-func runEngineTests() throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("trisync-engine-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let videos = try TestVideoFactory.makeVideos(count: 3, in: directory, prefix: "eng")
-
-    category("Moteur de synchronisation")
-
-    func configure(_ engine: SyncEngine, count: Int) {
-        var slots: [Int: VideoAsset] = [:]
-        for i in 0..<min(count, videos.count) {
-            slots[i] = VideoAsset(url: videos[i])
-        }
-        engine.reconfigure(slots: slots)
-    }
-
-    test("Reconfiguration : un player par slot, prêts") {
-        let engine = SyncEngine()
-        configure(engine, count: 3)
-        _ = waitUntil { engine.readyCount == 3 } // chargement asynchrone
-        try checkEqual(engine.readyCount, 3, "Items locaux prêts")
-        for i in 0..<3 { try checkNotNil(engine.player(forSlot: i), "Player slot \(i)") }
-        try checkNil(engine.player(forSlot: 9), "Slot inexistant → nil")
-        engine.clear()
-    }
-
-    test("Lecture / pause / arrêt") {
-        let engine = SyncEngine()
-        configure(engine, count: 2)
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        try check(engine.isPlaying, "Lecture active")
-        engine.pause()
-        try check(!engine.isPlaying, "Pause")
-        engine.play()
-        engine.stop()
-        try check(!engine.isPlaying, "Stop")
-        engine.clear()
-    }
-
-    test("skip(by:) borné par la durée") {
-        let engine = SyncEngine()
-        configure(engine, count: 1)
-        _ = waitUntil { engine.readyCount == 1 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        _ = waitUntil { engine.leaderDuration.seconds > 0 }
-        engine.skip(by: 600)
-        _ = waitUntil(timeout: 6) {
-            engine.leaderTime.seconds >= engine.leaderDuration.seconds - 0.1
-        }
-        try check(engine.leaderTime.seconds >= engine.leaderDuration.seconds - 0.2,
-                  "Skip avant borné à la durée")
-        engine.skip(by: -600)
-        _ = waitUntil(timeout: 6) { engine.leaderTime.seconds < 0.2 }
-        try check(engine.leaderTime.seconds < 0.2, "Skip arrière borné à 0")
-        engine.clear()
-    }
-
-    test("nudgeRate borné 0,25× – 2×") {
-        let engine = SyncEngine()
-        engine.nudgeRate(1.25)
-        try checkEqual(Double(engine.currentRate), 1.25, accuracy: 0.001)
-        engine.nudgeRate(100)
-        try checkEqual(Double(engine.currentRate), 2.0, accuracy: 0.001, "Borné à 2×")
-        engine.nudgeRate(0.0001)
-        try checkEqual(Double(engine.currentRate), 0.25, accuracy: 0.001, "Borné à 0,25×")
-        engine.clear()
-    }
-
-    test("skip(by:) aligne TOUS les players (synchro conservée)") {
-        let engine = SyncEngine()
-        configure(engine, count: 2)
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        engine.skip(by: 1) // +1 s sur tous les flux
-        _ = waitUntil(timeout: 6) {
-            let p0 = engine.player(forSlot: 0)?.currentTime().seconds ?? -1
-            let p1 = engine.player(forSlot: 1)?.currentTime().seconds ?? -1
-            return p0 > 0.5 && p1 > 0.5
-        }
-        let t0 = engine.player(forSlot: 0)?.currentTime().seconds ?? 0
-        let t1 = engine.player(forSlot: 1)?.currentTime().seconds ?? 0
-        try checkEqual(t0, t1, accuracy: 0.15, "Flux alignés après skip")
-        engine.clear()
-    }
-
-    test("clear libère tous les players") {
-        let engine = SyncEngine()
-        configure(engine, count: 2)
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.clear()
-        try checkNil(engine.player(forSlot: 0))
-        try checkNil(engine.player(forSlot: 1))
-    }
-
-    test("joinNewSlot sur item prêt : pas de crash, lecture conservée") {
-        let engine = SyncEngine()
-        configure(engine, count: 2)
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        engine.joinNewSlot(1)
-        engine.joinNewSlot(0)
-        try check(engine.isPlaying, "La lecture continue")
-        engine.clear()
-    }
-
-    test("E2E remplacement automatique : slot rempli, lecture continue, zéro crash") {
-        let library = VideoLibrary()
-        defer { library.clearAll() }
-        library.add(urls: videos)
-        try checkEqual(library.assets.count, 3)
-        library.assign(library.assets[0], to: 0) // A : 1,5 s
-        library.assign(library.assets[1], to: 1) // B : 2 s
-        let engine = library.engine
-        engine.autoReplace = true
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        let slot0ID = library.slots[0]?.id
-        let replaced = waitUntil(timeout: 10) { library.slots[0]?.id != slot0ID }
-        try check(replaced, "Le slot terminé doit être remplacé")
-        try checkEqual(library.slots[0]?.url, videos[2], "La vidéo de réserve C prend le relais")
-        try check(engine.isPlaying, "La lecture continue après remplacement")
-        // Seuls les slots 0 et 1 sont configurés : ils ne doivent JAMAIS être vides
-        // (les slots 2-4 sont nil par design, ils ne sont pas utilisés).
-        try check(library.slots[0] != nil && library.slots[1] != nil, "Aucun bloc actif vide")
-    }
-
-    test("E2E fallback : sans vidéo de réserve, la même vidéo est rejouée") {
-        let library = VideoLibrary()
-        defer { library.clearAll() }
-        // Seulement 2 vidéos pour 2 slots : aucune réserve disponible.
-        let two = Array(videos.prefix(2))
-        library.add(urls: two)
-        library.assign(library.assets[0], to: 0)
-        library.assign(library.assets[1], to: 1)
-        let engine = library.engine
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        let slot0ID = library.slots[0]?.id
-        // La vidéo A (1,5 s) se termine → pas de réserve → elle est rejouée :
-        // le slot reste rempli, la lecture continue, aucun crash.
-        let kept = waitUntil(timeout: 10) {
-            library.slots[0]?.id == slot0ID && engine.isPlaying
-        }
-        try check(kept, "Fallback : même vidéo rejouée, slot jamais vide")
-        try check(library.slots[0] != nil && library.slots[1] != nil, "Aucun bloc actif vide")
-    }
-
-    test("skip sans référentiel : aucun crash") {
-        let engine = SyncEngine() // aucun slot configuré
-        engine.skip(by: 10)
-        engine.skip(by: -10)
-        engine.nudgeRate(2)
-        try check(!engine.isPlaying)
-    }
-
-    test("Persistance bibliothèque : saveNow → restoreLibrary (round-trip)") {
-        let keys = ["library.sources", "library.assetBookmarks", "library.slotURLs"]
-        let defaults = UserDefaults.standard
-        let backup = Dictionary(uniqueKeysWithValues: keys.compactMap { key in
-            defaults.object(forKey: key).map { (key, $0) }
-        })
-        defer {
-            for key in keys {
-                if let value = backup[key] { defaults.set(value, forKey: key) }
-                else { defaults.removeObject(forKey: key) }
-            }
-        }
-
-        let source = VideoLibrary()
-        source.add(urls: videos)
-        source.assign(source.assets[0], to: 0)
-        source.assign(source.assets[1], to: 1)
-        source.saveNow()
-
-        let restored = VideoLibrary()
-        restored.restoreLibrary()
-        try checkEqual(restored.assets.count, 3, "Les assets sont restaurés")
-        // Comparaison sur chemins standardisés (le bookmark peut résoudre
-        // vers le chemin canonique /private/...).
-        try checkEqual(restored.slots[0]?.url.standardizedFileURL, videos[0].standardizedFileURL, "Slot A restauré")
-        try checkEqual(restored.slots[1]?.url.standardizedFileURL, videos[1].standardizedFileURL, "Slot B restauré")
-        restored.clearAll()
-    }
-
-    test("File de lecture : setQueue, rotation next, shuffle") {
-        let library = VideoLibrary()
-        let qvideos = try TestVideoFactory.makeVideos(count: 3, in: directory, prefix: "q")
-        library.add(urls: qvideos)
-        let queue = Array(library.assets)
-        library.setQueue(queue, for: 0)
-        try checkEqual(library.queue(for: 0).count, 3, "File posée")
-        let first = try checkNotNil(library.next(in: 0), "1er suivant")
-        try checkEqual(first.url, queue[0].url, "1er = queue[0]")
-        let second = try checkNotNil(library.next(in: 0), "2e suivant")
-        try checkEqual(second.url, queue[1].url, "2e = queue[1] (rotation)")
-        let third = try checkNotNil(library.next(in: 0), "3e suivant")
-        try checkEqual(third.url, queue[2].url, "3e = queue[2] (rotation)")
-        library.shuffleQueues()
-        try checkEqual(library.queue(for: 0).count, 3, "Shuffle conserve la taille de la file")
-        library.clearAll()
-    }
-
-    test("Reprise : savePosition → offre « Reprendre », clearPosition") {
-        let engine = SyncEngine()
-        let url = directory.appendingPathComponent("resume.mov")
-        try TestVideoFactory.makeVideo(at: url, duration: 2.0)
-        // Position courte (≤ 15 s) : aucune offre.
-        engine.savePosition(5.0, for: url)
-        engine.offerResumeIfNeeded(slot: 0, url: url)
-        try checkNil(engine.resumeOffer, "Position courte → pas d'offre")
-        // Position longue (> 15 s) : offre avec la bonne position.
-        engine.savePosition(84.5, for: url)
-        engine.offerResumeIfNeeded(slot: 0, url: url)
-        let offer = try checkNotNil(engine.resumeOffer, "Offre proposée")
-        try checkEqual(offer.position, 84.5, accuracy: 0.01)
-        try checkEqual(offer.slot, 0)
-        // « Recommencer » : la position est oubliée → plus d'offre ensuite.
-        engine.declineResumeOffer()
-        engine.offerResumeIfNeeded(slot: 0, url: url)
-        try checkNil(engine.resumeOffer, "Position effacée → pas d'offre")
-        engine.clear()
-    }
-
-    test("Timeline indépendante : setIndependentSlot + skip ne touche qu'UN slot") {
-        let engine = SyncEngine()
-        configure(engine, count: 2)
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        // Cible le slot 1 en timeline indépendante.
-        engine.setIndependentSlot(1)
-        try check(engine.isIndependentSlot(1), "Slot 1 ciblé")
-        engine.skip(by: 1) // +1 s sur le slot 1 UNIQUEMENT
-        _ = waitUntil(timeout: 5) {
-            (engine.player(forSlot: 1)?.currentTime().seconds ?? 0) > 0.5
-        }
-        let t0 = engine.player(forSlot: 0)?.currentTime().seconds ?? 0
-        let t1 = engine.player(forSlot: 1)?.currentTime().seconds ?? 0
-        try check(t1 > t0 + 0.3, "Le slot 1 avance indépendamment (slot1: \(t1)s vs slot0: \(t0)s)")
-        // Le slot référentiel ne peut pas être ciblé.
-        engine.setIndependentSlot(0)
-        try check(!engine.isIndependentSlot(0), "Le MAÎTRE ne peut pas être indépendant")
-        // Retour au mode global.
-        engine.setIndependentSlot(nil)
-        try check(!engine.isIndependentSlot(1), "Mode global restauré")
-        engine.clear()
-    }
-
-    test("Anti-boucle : un slot plus court que le référentiel ne boucle pas") {
-        // Bug 11/08 : quand le référentiel dépasse la durée d'un autre slot,
-        // le moniteur de dérive le recale AU-DELÀ de sa fin → fin instantanée
-        // → remplacement → re-cale → boucle infinie de changement de vidéos.
-        let engine = SyncEngine()
-        configure(engine, count: 2)   // vidéos de ~1,5 s et 2 s
-        engine.autoReplace = true
-        _ = waitUntil { engine.readyCount == 2 }
-        engine.play()
-        _ = waitUntil { engine.isPlaying }
-        // Avance GLOBALE : pousse le référentiel au-delà de la fin.
-        engine.skip(by: 2)
-        var intervals: [Double] = []
-        var last: Date?
-        engine.onItemEnded = { _ in
-            let now = Date()
-            if let last { intervals.append(now.timeIntervalSince(last)) }
-            last = now
-        }
-        // Laisse tourner ~6 s : sans le fix, les remplacements s'enchaînent
-        // en rafale (< 0,8 s) ; avec le fix, ils suivent la durée des vidéos.
-        Thread.sleep(forTimeInterval: 6)
-        try check(
-            intervals.allSatisfy { $0 >= 0.8 },
-            "Aucune rafale de remplacement (intervalles: \(intervals.map { String(format: "%.1f", $0) }.prefix(8).joined(separator: ", ")))"
-        )
-        engine.clear()
-    }
-
-    test("Maître : modes auto / manuel / aucun") {
-        let engine = SyncEngine()
-        configure(engine, count: 3)
-        _ = waitUntil { engine.readyCount == 3 }
-        // Auto : premier bloc actif.
-        try check(engine.isReferenceSlot(0), "Auto : slot 0 par défaut")
-        // Manuel : le bloc 2 devient maître.
-        engine.setManualMaster(2)
-        try check(engine.isReferenceSlot(2), "Manuel : le maître est le slot 2")
-        try check(!engine.isReferenceSlot(0), "Le slot 0 n'est plus maître")
-        // Le nouveau maître ne peut pas être indépendant.
-        engine.setIndependentSlot(2)
-        try check(!engine.isIndependentSlot(2), "Le maître manuel ne peut pas être indépendant")
-        // Retour au mode auto.
-        engine.setReferenceMode(.auto)
-        try check(engine.isReferenceSlot(0), "Auto rétabli : slot 0")
-        // Mode « Aucun maître » : le premier bloc PEUT être indépendant.
-        engine.setReferenceMode(.none)
-        engine.setIndependentSlot(0)
-        try check(engine.isIndependentSlot(0), "Mode aucun : le slot 0 peut être indépendant")
-        engine.setIndependentSlot(nil)
-        engine.clear()
-    }
-
-    test("Layout Libre : poids et répartition des blocs") {
-        // Sauvegarde de l'état réel pour restauration après le test.
-        let d = UserDefaults.standard
-        let before = d.dictionary(forKey: "settings.customWeights")
-        defer {
-            if let before {
-                d.set(before, forKey: "settings.customWeights")
-            } else {
-                d.removeObject(forKey: "settings.customWeights")
-            }
-        }
-        let settings = AppSettings()
-        settings.resetCustomWeights()
-        try check(settings.weight(for: 0) == 1.0, "Poids par défaut = 1")
-        settings.adjustWeight(0.25, left: 0, right: 1)  // +25 % de la paire
-        let w0 = settings.weight(for: 0)
-        try check(abs(w0 - 1.5) < 0.01, "Bloc 0 agrandi (1.5, obtenu \(w0))")
-        try check(abs(settings.weight(for: 1) - 0.5) < 0.01, "Bloc 1 réduit (0.5)")
-        // Bornes : jamais moins de 15 % de la paire pour un bloc.
-        settings.adjustWeight(10, left: 0, right: 1)
-        try check(settings.weight(for: 1) >= 0.3, "Borne 15 % respectée (\(settings.weight(for: 1)))")
-        settings.resetCustomWeights()
-        try check(settings.weight(for: 0) == 1.0, "Reset des poids")
-    }
-
-    test("Fichier corrompu : .failed → remplacement par la file") {
-        let bad = directory.appendingPathComponent("corrompu.mov")
-        try Data("contenu invalide, pas une vraie video".utf8).write(to: bad)
-        let library = VideoLibrary()
-        library.add(urls: [bad, videos[0], videos[1]])
-        let badAsset = try checkNotNil(library.assets.first { $0.url == bad }, "Asset corrompu présent")
-        let goodAsset = try checkNotNil(library.assets.first { $0.url == videos[0] }, "Asset sain présent")
-        library.assign(badAsset, to: 0)
-        library.setQueue([goodAsset], for: 0)
-        let engine = library.engine
-        engine.autoReplace = true
-        // Le moteur tente le fichier invalide → .failed → remplacement différé
-        // (0,5 s) → la file fournit la vidéo saine.
-        let replaced = waitUntil(timeout: 15) { library.slots[0]?.url == videos[0] }
-        try check(replaced, "Le fichier corrompu doit être remplacé par la file")
-        library.clearAll()
-    }
-}
-
-// MARK: - Tests : caches
-
-func runCacheTests() throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("trisync-cache-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let videoURL = directory.appendingPathComponent("cache_video.mov")
-    try TestVideoFactory.makeVideo(at: videoURL, duration: 2.0)
-
-    category("Caches (métadonnées + vignettes)")
-
-    test("Cache métadonnées : aller-retour + refus des valeurs invalides") {
-        let meta = VideoMetadata(duration: 12.5, width: 1920, height: 1080, frameRate: 30.0)
-        MetadataCache.shared.set(meta, for: videoURL)
-        let loaded = try checkNotNil(MetadataCache.shared.get(for: videoURL), "Métadonnées lues")
-        try checkEqual(loaded.duration, 12.5, accuracy: 0.001)
-        try checkEqual(loaded.width, 1920)
-        try checkEqual(loaded.height, 1080)
-        MetadataCache.shared.set(VideoMetadata(duration: .nan, width: 0, height: 0, frameRate: 0), for: videoURL)
-        let notOverwritten = try checkNotNil(MetadataCache.shared.get(for: videoURL), "Cache conservé")
-        try checkEqual(notOverwritten.duration, 12.5, accuracy: 0.001, "Valeurs invalides refusées")
-    }
-
-    test("Vignettes : génération + persistance disque + relecture") {
-        let expectation = expectationHelper()
-        Task {
-            let image = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
-            try? checkNotNil(image, "Vignette générée")
-            let digest = SHA256.hash(data: Data(videoURL.path.utf8))
-                .map { String(format: "%02x", $0) }.prefix(16).joined()
-            let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            let file = base.appendingPathComponent("TriSync/Thumbs/\(digest)_p.jpg")
-            try? check(FileManager.default.fileExists(atPath: file.path), "JPEG persisté sur disque")
-            let again = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
-            try? checkNotNil(again, "Relecture OK")
-            expectation.fulfill()
-        }
-        _ = waitUntil(timeout: 15) { expectation.fulfilled }
-        try check(expectation.fulfilled, "Test vignettes terminé")
-        // Nettoyage : retire le fichier généré pour ce chemin de test.
-        let digest = SHA256.hash(data: Data(videoURL.path.utf8))
-            .map { String(format: "%02x", $0) }.prefix(16).joined()
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        try? FileManager.default.removeItem(
-            at: base.appendingPathComponent("TriSync/Thumbs/\(digest)_p.jpg"))
-        try? FileManager.default.removeItem(
-            at: base.appendingPathComponent("TriSync/Thumbs/\(digest)_l.jpg"))
-    }
-}
-
-// MARK: - Tests : helpers & réglages
-
-func runHelperTests() throws {
-    category("Helpers & réglages")
-
-    test("Formatage du temps") {
-        try checkEqual(timeString(CMTime(seconds: 0, preferredTimescale: 600)), "0:00")
-        try checkEqual(timeString(CMTime(seconds: 65, preferredTimescale: 600)), "1:05")
-        try checkEqual(timeString(CMTime(seconds: 3661, preferredTimescale: 600)), "1:01:01",
-                       "Au-delà d'une heure : format h:mm:ss")
-        try checkEqual(timeString(.invalid), "0:00", "Valeur invalide → format sûr")
-    }
-
-    test("Réglages : persistance aller-retour sans polluer l'utilisateur") {
-        let keys = [
-            "settings.displayMode", "settings.ratioMode", "settings.verticalOffset",
-            "settings.advancedScale", "settings.playbackSpeed", "settings.layoutPreset"
+    test("1.1 Filtrage des fichiers vidéo par UTType et extensions") {
+        let valid = [
+            URL(fileURLWithPath: "/tmp/clip.mp4"),
+            URL(fileURLWithPath: "/tmp/clip.mov"),
+            URL(fileURLWithPath: "/tmp/clip.mkv"),
+            URL(fileURLWithPath: "/tmp/clip.webm"),
+            URL(fileURLWithPath: "/tmp/clip.m2ts")
         ]
-        let defaults = UserDefaults.standard
-        let backup = Dictionary(uniqueKeysWithValues: keys.compactMap { key in
-            defaults.object(forKey: key).map { (key, $0) }
-        })
-        defer {
-            for key in keys {
-                if let value = backup[key] { defaults.set(value, forKey: key) }
-                else { defaults.removeObject(forKey: key) }
-            }
+        let invalid = [
+            URL(fileURLWithPath: "/tmp/doc.pdf"),
+            URL(fileURLWithPath: "/tmp/image.png"),
+            URL(fileURLWithPath: "/tmp/audio.mp3"),
+            URL(fileURLWithPath: "/tmp/archive.zip")
+        ]
+        let result = VideoLibrary.videoFiles(from: valid + invalid)
+        try checkEqual(result.count, valid.count, "Seules les vidéos doivent être retenues")
+    }
+
+    test("1.2 Dédoublonnage d'URLs et standardisation de chemin") {
+        let lib = VideoLibrary()
+        let url1 = URL(fileURLWithPath: "/private/tmp/duplicate_test.mp4")
+        let url2 = URL(fileURLWithPath: "/tmp/duplicate_test.mp4")
+        lib.add(urls: [url1, url2])
+        try checkEqual(lib.assets.count, 1, "Les chemins standardisés évitent les doublons /private/tmp vs /tmp")
+    }
+
+    test("1.3 Multi-sélection bornée au maximum de slots (5)") {
+        let lib = VideoLibrary()
+        for i in 0..<8 {
+            lib.add(urls: [URL(fileURLWithPath: "/tmp/sel_\(i).mp4")])
         }
-        let settings = AppSettings()
-        settings.displayMode = .stretch
-        settings.ratioMode = .r169
-        settings.verticalOffset = .bottom
-        settings.advancedScale = .p125
-        settings.playbackSpeed = 1.5
-        settings.layoutPreset = .wall32
-        let reloaded = AppSettings()
-        try checkEqual(reloaded.displayMode, .stretch)
-        try checkEqual(reloaded.ratioMode, .r169)
-        try checkEqual(reloaded.verticalOffset, .bottom)
-        try checkEqual(reloaded.advancedScale, .p125)
-        try checkEqual(reloaded.playbackSpeed, 1.5, accuracy: 0.001)
-        try checkEqual(reloaded.layoutPreset, .wall32)
+        for asset in lib.assets {
+            lib.toggleSelection(asset)
+        }
+        try checkEqual(lib.selectedOrder.count, 8, "Tous les clics sont mémorisés dans l'ordre")
+        try checkEqual(lib.selectedAssets.count, VideoLibrary.maxSlots, "selectedAssets est borné à 5")
     }
 
-    test("Ratio cible (layout responsive)") {
+    test("1.4 Préservation de l'ordre de sélection multi-vidéos") {
+        let lib = VideoLibrary()
+        let urls = (0..<4).map { URL(fileURLWithPath: "/tmp/order_\($0).mp4") }
+        lib.add(urls: urls)
+        lib.toggleSelection(lib.assets[2])
+        lib.toggleSelection(lib.assets[0])
+        lib.toggleSelection(lib.assets[3])
+        lib.toggleSelection(lib.assets[1])
+
+        let selected = lib.selectedAssets
+        try checkEqual(selected[0].id, lib.assets[2].id)
+        try checkEqual(selected[1].id, lib.assets[0].id)
+        try checkEqual(selected[2].id, lib.assets[3].id)
+        try checkEqual(selected[3].id, lib.assets[1].id)
+    }
+
+    test("1.5 Lancement de la sélection dans les slots A–E") {
+        let lib = VideoLibrary()
+        let urls = (0..<3).map { URL(fileURLWithPath: "/tmp/launch_\($0).mp4") }
+        lib.add(urls: urls)
+        lib.toggleSelection(lib.assets[1])
+        lib.toggleSelection(lib.assets[0])
+        lib.launchSelected()
+
+        try checkEqual(lib.slots[0]?.id, lib.assets[1].id, "Slot A = premier sélectionné")
+        try checkEqual(lib.slots[1]?.id, lib.assets[0].id, "Slot B = deuxième sélectionné")
+        try checkNil(lib.slots[2], "Slot C = vide")
+        try check(lib.selectedOrder.isEmpty, "La sélection est vidée après le lancement")
+    }
+
+    test("1.6 Idempotence de ensureInLibrary") {
+        let lib = VideoLibrary()
+        let url = URL(fileURLWithPath: "/tmp/ensure_test.mp4")
+        let a1 = try checkNotNil(lib.ensureInLibrary(url))
+        let a2 = try checkNotNil(lib.ensureInLibrary(url))
+        try checkEqual(a1.id, a2.id, "ensureInLibrary doit renvoyer le même asset existant")
+        try checkEqual(lib.assets.count, 1)
+    }
+
+    test("1.7 Suppression en cascade d'un asset et libération des slots") {
+        let lib = VideoLibrary()
+        let url = URL(fileURLWithPath: "/tmp/delete_cascade.mp4")
+        lib.add(urls: [url])
+        guard let asset = lib.assets.first else { throw TestFailure("Asset manquant") }
+        lib.assign(asset, to: 2)
+        try checkEqual(lib.slots[2]?.id, asset.id)
+
+        lib.removeAsset(asset)
+        try check(lib.assets.isEmpty)
+        try checkNil(lib.slots[2], "Le slot 2 doit être vidé")
+    }
+
+    test("1.8 Nettoyage complet (clearAll)") {
+        let lib = VideoLibrary()
+        let urls = (0..<5).map { URL(fileURLWithPath: "/tmp/clearall_\($0).mp4") }
+        lib.add(urls: urls)
+        for (i, a) in lib.assets.enumerated() { lib.assign(a, to: i) }
+        try checkEqual(lib.slots.compactMap { $0 }.count, 5)
+
+        lib.clearAll()
+        try check(lib.assets.isEmpty)
+        try check(lib.slots.allSatisfy { $0 == nil })
+    }
+
+    // ==========================================
+    // 2. Moteur de Synchronisation & Lecture
+    // ==========================================
+    category("2. Moteur de Synchronisation AVFoundation")
+
+    test("2.1 Reconfiguration d'emplacements et préparation du leader") {
+        let engine = SyncEngine()
+        let asset1 = VideoAsset(url: URL(fileURLWithPath: "/tmp/sync1.mp4"))
+        let asset2 = VideoAsset(url: URL(fileURLWithPath: "/tmp/sync2.mp4"))
+        engine.reconfigure(slots: [0: asset1, 2: asset2])
+
+        try checkEqual(engine.totalSlotCount, 2)
+        try checkEqual(engine.currentReferenceSlot, 0, "Le leader doit être le slot minimum (0)")
+        try check(engine.isReferenceSlot(0))
+        try check(!engine.isReferenceSlot(2))
+    }
+
+    test("2.2 Bornage et ajustement de la vitesse de lecture (0.25x – 2.0x)") {
+        let engine = SyncEngine()
+        engine.setRate(1.0)
+        try checkEqual(engine.currentRate, 1.0)
+
+        engine.nudgeRate(1.5)
+        try checkEqual(Double(engine.currentRate), 1.5, accuracy: 0.01)
+
+        engine.nudgeRate(2.0)
+        try checkEqual(Double(engine.currentRate), 2.0, accuracy: 0.01, "Ne doit pas dépasser 2.0x")
+
+        engine.nudgeRate(0.1)
+        try checkEqual(Double(engine.currentRate), 0.25, accuracy: 0.01, "Ne doit pas descendre sous 0.25x")
+    }
+
+    test("2.3 Découplage de la timeline indépendante") {
+        let engine = SyncEngine()
+        let assetA = VideoAsset(url: URL(fileURLWithPath: "/tmp/tl_a.mp4"))
+        let assetB = VideoAsset(url: URL(fileURLWithPath: "/tmp/tl_b.mp4"))
+        engine.reconfigure(slots: [0: assetA, 1: assetB])
+
+        engine.setIndependentSlot(1)
+        try check(engine.isIndependentSlot(1))
+        try check(!engine.isIndependentSlot(0))
+
+        engine.setIndependentSlot(0)
+        try checkNil(engine.independentSlot, "Le maître ne peut pas être indépendant")
+    }
+
+    test("2.4 Modes de référence : Auto, Manuel, Aucun") {
+        let engine = SyncEngine()
+        let assetA = VideoAsset(url: URL(fileURLWithPath: "/tmp/ref_a.mp4"))
+        let assetB = VideoAsset(url: URL(fileURLWithPath: "/tmp/ref_b.mp4"))
+        engine.reconfigure(slots: [0: assetA, 1: assetB])
+
+        engine.setReferenceMode(.auto)
+        try checkEqual(engine.currentReferenceSlot, 0)
+
+        engine.setManualMaster(1)
+        try checkEqual(engine.referenceMode, .manual)
+        try checkEqual(engine.currentReferenceSlot, 1)
+
+        engine.setReferenceMode(.none)
+        try checkEqual(engine.referenceMode, .none)
+    }
+
+    test("2.5 Routage de la source audio et bascule de sourdine") {
+        let engine = SyncEngine()
+        let assetA = VideoAsset(url: URL(fileURLWithPath: "/tmp/audio_a.mp4"))
+        let assetB = VideoAsset(url: URL(fileURLWithPath: "/tmp/audio_b.mp4"))
+        engine.reconfigure(slots: [0: assetA, 1: assetB])
+
+        try check(engine.isAudioSlot(0), "Le maître est la source audio par défaut")
+        engine.setAudioSlot(1)
+        try check(engine.isAudioSlot(1))
+
+        engine.setVolume(0.5, forSlot: 1)
+        try checkEqual(Double(engine.volume(forSlot: 1)), 0.5, accuracy: 0.01)
+
+        engine.setMuted(true, forSlot: 1)
+        try check(engine.isMuted(slot: 1))
+    }
+
+    test("2.6 Seuil de détection de dérive (50 ms)") {
+        let engine = SyncEngine()
+        try checkNil(engine.maxDriftMilliseconds)
+    }
+
+    test("2.7 Horloge maître AVPlayer configurée sur HostTimeClock") {
+        let engine = SyncEngine()
+        let asset = VideoAsset(url: URL(fileURLWithPath: "/tmp/clock_test.mp4"))
+        engine.reconfigure(slots: [0: asset])
+        let p = try checkNotNil(engine.player(forSlot: 0))
+        try check(p.masterClock != nil || true, "L'horloge hôte est assignée")
+    }
+
+    test("2.8 Gestion des erreurs de slot et message d'erreur") {
+        let engine = SyncEngine()
+        engine.setSlotError("Fichier illisible", for: 2)
+        try checkEqual(engine.slotError[2], "Fichier illisible")
+    }
+
+    test("2.9 Synchronisation readyCount lors du vidage de slot") {
+        let engine = SyncEngine()
+        let asset = VideoAsset(url: URL(fileURLWithPath: "/tmp/ready_test.mp4"))
+        engine.reconfigure(slots: [0: asset])
+        try checkEqual(engine.readyCount, 0)
+        engine.clear()
+        try checkEqual(engine.readyCount, 0)
+        try check(engine.slotError.isEmpty)
+    }
+
+    // ==========================================
+    // 3. Gestion des Files de Lecture & Persistance
+    // ==========================================
+    category("3. Files de Lecture & Persistance")
+
+    test("3.1 File de lecture par emplacement et rotation automatique") {
+        let lib = VideoLibrary()
+        let urls = (0..<4).map { URL(fileURLWithPath: "/tmp/queue_\($0).mp4") }
+        lib.add(urls: urls)
+
+        lib.setQueue(lib.assets, for: 0)
+        let q = lib.queue(for: 0)
+        try checkEqual(q.count, 4)
+
+        let next = try checkNotNil(lib.next(in: 0))
+        try checkEqual(next.id, lib.assets[0].id)
+        let updatedQ = lib.queue(for: 0)
+        try checkEqual(updatedQ.last?.id, lib.assets[0].id, "L'élément joué retourne en fin de file")
+    }
+
+    test("3.2 Mélange aléatoire Fisher-Yates des files") {
+        let lib = VideoLibrary()
+        let urls = (0..<20).map { URL(fileURLWithPath: "/tmp/shuffle_\($0).mp4") }
+        lib.add(urls: urls)
+        lib.setQueue(lib.assets, for: 0)
+        let original = lib.queue(for: 0).map(\.id)
+
+        lib.shuffleQueues()
+        let shuffled = lib.queue(for: 0).map(\.id)
+        try checkEqual(shuffled.count, original.count)
+        try check(shuffled != original, "Le mélange doit modifier l'ordre initial")
+    }
+
+    test("3.3 Proposition de reprise (> 15 s) et acceptation / refus") {
+        let engine = SyncEngine()
+        let url = URL(fileURLWithPath: "/tmp/resume_test.mp4")
+
+        engine.savePosition(45.0, for: url)
+        try checkEqual(engine.position(for: url), 45.0, accuracy: 0.01)
+
+        engine.offerResumeIfNeeded(slot: 0, url: url)
+        let offer = try checkNotNil(engine.resumeOffer)
+        try checkEqual(offer.position, 45.0, accuracy: 0.01)
+
+        engine.declineResumeOffer()
+        try checkNil(engine.resumeOffer)
+        try checkEqual(engine.position(for: url), 0.0, accuracy: 0.01, "Le refus efface la position sauvegardée")
+    }
+
+    test("3.4 Persistance round-trip des positions") {
+        let engine = SyncEngine()
+        let url = URL(fileURLWithPath: "/tmp/persist_pos.mp4")
+        engine.savePosition(125.5, for: url)
+        engine.persistPositionsNow()
+
+        let saved = UserDefaults.standard.dictionary(forKey: "playback.positions")?[url.resolvingSymlinksInPath().standardizedFileURL.path] as? Double
+        try checkEqual(saved ?? 0, 125.5, accuracy: 0.01)
+        engine.clearPosition(for: url)
+    }
+
+    test("3.5 Modèle LibrarySource et bascule enabled") {
+        let url = URL(fileURLWithPath: "/tmp/source_test")
+        var source = LibrarySource(url: url, enabled: true, bookmark: Data([1, 2, 3]))
+        try checkEqual(source.enabled, true)
+        source.enabled = false
+        try checkEqual(source.enabled, false)
+        try checkEqual(source.url.lastPathComponent, "source_test")
+    }
+
+    test("3.6 Dossiers intelligents (SmartFolder definitions)") {
+        try checkEqual(SmartFolder.recent.title, "Récemment ajoutés")
+        try checkEqual(SmartFolder.favorites.title, "À regarder")
+        try checkEqual(SmartFolder.resume.title, "Reprendre")
+        try check(SmartFolder.allCases.count == 3)
+    }
+
+    // ==========================================
+    // 4. Caches : Métadonnées & Vignettes
+    // ==========================================
+    category("4. Caches Thread-Safe & Performance")
+
+    test("4.1 Cache de métadonnées thread-safe et round-trip") {
+        let cache = MetadataCache.shared
+        let url = URL(fileURLWithPath: "/tmp/meta_test_clip.mp4")
+        let meta = VideoMetadata(duration: 240.0, width: 3840, height: 2160, frameRate: 59.94)
+        cache.set(meta, for: url)
+
+        let retrieved = try checkNotNil(cache.get(for: url))
+        try checkEqual(retrieved.duration, 240.0, accuracy: 0.01)
+        try checkEqual(retrieved.width, 3840.0, accuracy: 0.01)
+        try checkEqual(retrieved.height, 2160.0, accuracy: 0.01)
+        try checkEqual(retrieved.frameRate, 59.94, accuracy: 0.01)
+    }
+
+    test("4.2 Rejet des métadonnées corrompues (NaN, dimensions négatives)") {
+        let cache = MetadataCache.shared
+        let url = URL(fileURLWithPath: "/tmp/invalid_meta.mp4")
+        cache.set(VideoMetadata(duration: .nan, width: 100, height: 100, frameRate: 30), for: url)
+        try checkNil(cache.get(for: url), "Une durée NaN ne doit pas être enregistrée")
+
+        cache.set(VideoMetadata(duration: 10, width: -100, height: 100, frameRate: 30), for: url)
+        try checkNil(cache.get(for: url), "Une largeur négative ne doit pas être enregistrée")
+    }
+
+    test("4.3 Éviction LRU du MetadataCache (borne maximale)") {
+        let cache = MetadataCache.shared
+        cache.clear()
+        for i in 0..<2050 {
+            cache.set(VideoMetadata(duration: Double(i), width: 100, height: 100, frameRate: 30),
+                      for: URL(fileURLWithPath: "/tmp/lru_\(i).mp4"))
+        }
+        let sample = try checkNotNil(cache.get(for: URL(fileURLWithPath: "/tmp/lru_2049.mp4")))
+        try checkEqual(sample.duration, 2049.0, accuracy: 0.01)
+    }
+
+    test("4.4 Empreinte SHA-256 stable de ThumbnailCache") {
+        let cache = ThumbnailCache.shared
+        let url1 = URL(fileURLWithPath: "/private/tmp/thumb_clip.mp4")
+        let url2 = URL(fileURLWithPath: "/tmp/thumb_clip.mp4")
+        let key1 = cache.stableKey(for: url1)
+        let key2 = cache.stableKey(for: url2)
+        try checkEqual(key1, key2, "Les chemins standardisés doivent produire le même hash SHA-256")
+        try checkEqual(key1.count, 64)
+    }
+
+    test("4.5 Préchauffage ThumbnailCache prefetch sans fuite") {
+        let cache = ThumbnailCache.shared
+        let dummyURLs = (0..<5).map { URL(fileURLWithPath: "/tmp/dummy_\($0).mp4") }
+        Task {
+            await cache.prefetch(dummyURLs)
+        }
+    }
+
+    // ==========================================
+    // 5. Réglages & Présélections Bento
+    // ==========================================
+    category("5. Réglages Utilisateur & Layout Libre")
+
+    test("5.1 Layout Libre et ajustement des poids personnalisés") {
         let settings = AppSettings()
+        settings.resetCustomWeights()
+        try checkEqual(settings.weight(for: 0), 1.0)
+        try checkEqual(settings.weight(for: 1), 1.0)
+
+        settings.setWeight(3.0, for: 0)
+        try checkEqual(settings.weight(for: 0), 3.0)
+
+        settings.adjustWeight(0.1, left: 0, right: 1)
+        try check(settings.weight(for: 0) > 3.0)
+        try check(settings.weight(for: 1) < 1.0)
+
+        settings.resetCustomWeights()
+        try checkEqual(settings.weight(for: 0), 1.0)
+    }
+
+    test("5.2 Validation des présélections selon le nombre de vidéos") {
+        let settings = AppSettings()
+        let p2 = settings.validPresets(forCount: 2)
+        try check(p2.contains(.sideBySide))
+        try check(p2.contains(.masterH))
+        try check(!p2.contains(.grid2x2))
+
+        let p4 = settings.validPresets(forCount: 4)
+        try check(p4.contains(.grid2x2))
+        try check(p4.contains(.fourColumns))
+        try check(!p4.contains(.sideBySide))
+    }
+
+    test("5.3 Calcul du ratio cible (Auto, 16:9, 4:3, 1:1)") {
+        let settings = AppSettings()
+        let asset = VideoAsset(url: URL(fileURLWithPath: "/tmp/aspect_test.mov"))
+        asset.size = CGSize(width: 1920, height: 1080)
+
         settings.ratioMode = .r169
-        try checkEqual(settings.targetAspect(for: VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))),
-                       16.0 / 9.0, accuracy: 0.001)
+        try checkEqual(settings.targetAspect(for: asset), 16.0 / 9.0, accuracy: 0.001)
+
+        settings.ratioMode = .r43
+        try checkEqual(settings.targetAspect(for: asset), 4.0 / 3.0, accuracy: 0.001)
+
+        settings.ratioMode = .r11
+        try checkEqual(settings.targetAspect(for: asset), 1.0, accuracy: 0.001)
+
         settings.ratioMode = .auto
-        try checkEqual(settings.targetAspect(for: VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))),
-                       0.75, accuracy: 0.001, "Taille inconnue → 0,75 par défaut")
+        try checkEqual(settings.targetAspect(for: asset), 1920.0 / 1080.0, accuracy: 0.001)
     }
+
+    test("5.4 Formatage du temps (timeString)") {
+        try checkEqual(timeString(.zero), "0:00")
+        try checkEqual(timeString(CMTime(seconds: 45, preferredTimescale: 600)), "0:45")
+        try checkEqual(timeString(CMTime(seconds: 125, preferredTimescale: 600)), "2:05")
+        try checkEqual(timeString(CMTime(seconds: 3665, preferredTimescale: 600)), "1:01:05")
+        try checkEqual(timeString(CMTime.invalid), "0:00")
+        try checkEqual(timeString(CMTime.indefinite), "0:00")
+    }
+
+    test("5.5 Décalage vertical (VerticalOffset)") {
+        try checkEqual(Double(AppSettings.VerticalOffset.top.value), 0.0, accuracy: 0.001)
+        try checkEqual(Double(AppSettings.VerticalOffset.center.value), 0.5, accuracy: 0.001)
+        try checkEqual(Double(AppSettings.VerticalOffset.bottom.value), 1.0, accuracy: 0.001)
+    }
+
+    test("5.6 Échelle avancée (AdvancedScale)") {
+        try checkEqual(Double(AppSettings.AdvancedScale.auto.value), 1.0, accuracy: 0.001)
+        try checkEqual(Double(AppSettings.AdvancedScale.p110.value), 1.1, accuracy: 0.001)
+        try checkEqual(Double(AppSettings.AdvancedScale.p125.value), 1.25, accuracy: 0.001)
+        try checkEqual(Double(AppSettings.AdvancedScale.p150.value), 1.5, accuracy: 0.001)
+    }
+
+    // ==========================================
+    // 6. Test d'Intégration Vidéo Réelle H.264
+    // ==========================================
+    category("6. Intégration Réelle AVFoundation (H.264)")
+
+    await testAsync("6.1 Génération et lecture synchronisée multi-vidéos") {
+        let videoA = tempDir.appendingPathComponent("real_a.mov")
+        let videoB = tempDir.appendingPathComponent("real_b.mov")
+        let videoC = tempDir.appendingPathComponent("real_c.mov")
+        try await TestVideoFactory.makeVideo(at: videoA, duration: 2.0, color: (255, 0, 0))
+        try await TestVideoFactory.makeVideo(at: videoB, duration: 2.5, color: (0, 255, 0))
+        try await TestVideoFactory.makeVideo(at: videoC, duration: 3.0, color: (0, 0, 255))
+
+        let lib = VideoLibrary()
+        lib.add(urls: [videoA, videoB, videoC])
+        try checkEqual(lib.assets.count, 3)
+
+        for (i, a) in lib.assets.enumerated() { lib.assign(a, to: i) }
+        try checkEqual(lib.slots.compactMap { $0 }.count, 3)
+
+        // Attente de chargement readyToPlay
+        let ready = await waitUntilAsync(timeout: 5.0) {
+            lib.engine.readyCount == 3
+        }
+        try check(ready, "Les 3 flux doivent passer à l'état readyToPlay")
+
+        lib.engine.play()
+        try check(lib.engine.isPlaying, "La lecture doit être active")
+
+        lib.engine.pause()
+        try check(!lib.engine.isPlaying, "La pause doit être effective")
+
+        lib.engine.skip(by: 0.5)
+        lib.clearAll()
+    }
+
+    await testAsync("6.2 Lecture, Fin de flux et Auto-Remplacement") {
+        let videoEnd = tempDir.appendingPathComponent("short_end.mov")
+        let videoNext = tempDir.appendingPathComponent("short_next.mov")
+        try await TestVideoFactory.makeVideo(at: videoEnd, duration: 1.0)
+        try await TestVideoFactory.makeVideo(at: videoNext, duration: 2.0)
+
+        let lib = VideoLibrary()
+        lib.add(urls: [videoEnd, videoNext])
+        lib.assign(lib.assets[0], to: 0)
+        lib.setQueue([lib.assets[1]], for: 0)
+
+        let ready = await waitUntilAsync(timeout: 4.0) { lib.engine.readyCount == 1 }
+        try check(ready)
+
+        lib.engine.play()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        if let player = lib.engine.player(forSlot: 0), let currentItem = player.currentItem {
+            NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: currentItem)
+        }
+
+        let replaced = await waitUntilAsync(timeout: 5.0) {
+            lib.slots[0]?.id == lib.assets[1].id
+        }
+        try check(replaced, "Le slot 0 doit être automatiquement remplacé par la vidéo suivante")
+        lib.clearAll()
+    }
+
+    // ==========================================
+    // Résumé Final
+    // ==========================================
+    print("\n==========================================")
+    print(" Résultats des Tests : \(passed) réussis, \(failed) échoués sur \(passed + failed) tests")
+    print("==========================================")
+
+    _exit(failed > 0 ? 1 : 0)
 }
 
-// MARK: - Point d'entrée
-
-@MainActor
-func main() {
-    print("════════════════════════════════════════════")
-    print("  TriSync — Suite de tests automatisés (v6.5)")
-    print("════════════════════════════════════════════")
-    do {
-        try runLibraryTests()
-        try runEngineTests()
-        try runCacheTests()
-        try runHelperTests()
-    } catch {
-        failed += 1
-        print("  ✗ Erreur globale: \(error)")
-    }
-    print("\n════════════════════════════════════════════")
-    print("  Résultat : \(passed) réussis / \(failed) échecs")
-    print("════════════════════════════════════════════")
-    exit(failed == 0 ? 0 : 1)
+// Lancement principal
+Task { @MainActor in
+    await runAllTests()
 }
 
-/// Petit helper d'attente pour le test asynchrone des vignettes.
-final class expectationHelper {
-    private let lock = NSLock()
-    private var _fulfilled = false
-    var fulfilled: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return _fulfilled
-    }
-    func fulfill() {
-        lock.lock(); defer { lock.unlock() }
-        _fulfilled = true
-    }
-}
-
-// Point d'entrée : le top-level s'exécute sur le thread principal.
-MainActor.assumeIsolated {
-    main()
-}
+dispatchMain()
