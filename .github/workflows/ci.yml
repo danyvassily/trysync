@@ -1,0 +1,49 @@
+name: TriSync CI
+
+on:
+  push:
+    branches: [main, "cto/**", "agent/**"]
+    paths:
+      - "TriSyncPkg/**"
+      - "SelfTest/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "TriSyncPkg/**"
+      - "SelfTest/**"
+      - ".github/workflows/ci.yml"
+
+concurrency:
+  group: trisync-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  swiftpm:
+    name: Build & test (macOS)
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Resolve package
+        run: swift package --package-path TriSyncPkg resolve
+
+      - name: Debug build (warnings are errors)
+        run: swift build --package-path TriSyncPkg -Xswiftc -warnings-as-errors
+
+      - name: Tests (warnings are errors)
+        run: swift test --package-path TriSyncPkg -Xswiftc -warnings-as-errors
+
+      - name: Release build (warnings are errors)
+        run: swift build --package-path TriSyncPkg -c release -Xswiftc -warnings-as-errors
