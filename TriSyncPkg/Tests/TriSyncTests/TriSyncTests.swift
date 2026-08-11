@@ -115,7 +115,6 @@ final class VideoLibraryTests: XCTestCase {
         super.tearDown()
     }
 
-    // 1
     @MainActor
     func testVideoFileFiltering() throws {
         let movie = directory.appendingPathComponent("a.mov")
@@ -130,7 +129,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertFalse(accepted.contains(image))
     }
 
-    // 2
     @MainActor
     func testDeduplication() throws {
         let library = VideoLibrary()
@@ -141,7 +139,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertEqual(library.assets.count, 1)
     }
 
-    // 3
     @MainActor
     func testSelectionCappedAtFive() throws {
         let library = VideoLibrary()
@@ -154,7 +151,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertEqual(library.selectedAssets.first?.url, videos.first)
     }
 
-    // 4
     @MainActor
     func testLaunchSelectedFillsSlots() throws {
         let library = VideoLibrary()
@@ -170,7 +166,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertEqual(filled[1].url, videos[1])
     }
 
-    // 5
     @MainActor
     func testEnsureInLibraryDoesNotOccupySlot() throws {
         let library = VideoLibrary()
@@ -182,7 +177,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertTrue(library.slots.allSatisfy { $0 == nil })
     }
 
-    // 6
     @MainActor
     func testClearAll() throws {
         let library = VideoLibrary()
@@ -195,13 +189,11 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertTrue(library.selectedOrder.isEmpty)
     }
 
-    // 20
     func testVideoFileFilteringIsCaseInsensitive() {
         let upper = URL(fileURLWithPath: "/tmp/TriSync-Test.MKV")
         XCTAssertEqual(VideoLibrary.videoFiles(from: [upper]), [upper])
     }
 
-    // 21
     @MainActor
     func testToggleSelectionIsReversible() {
         let library = VideoLibrary()
@@ -213,7 +205,6 @@ final class VideoLibraryTests: XCTestCase {
         XCTAssertTrue(library.selectedOrder.isEmpty)
     }
 
-    // 22
     @MainActor
     func testPlaceUsesFirstFreeSlot() throws {
         let library = VideoLibrary()
@@ -257,7 +248,6 @@ final class SyncEngineTests: XCTestCase {
         engine.reconfigure(slots: slots)
     }
 
-    // 7
     func testReconfigureCreatesPlayers() {
         configure(3)
         XCTAssertTrue(waitUntil { engine.readyCount == 3 })
@@ -265,7 +255,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNil(engine.player(forSlot: 9))
     }
 
-    // 8
     func testPlayPauseStop() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -278,7 +267,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertFalse(engine.isPlaying)
     }
 
-    // 9
     func testSkipClampedToDuration() {
         configure(1)
         XCTAssertTrue(waitUntil { engine.readyCount == 1 })
@@ -292,7 +280,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertTrue(waitUntil(timeout: 4) { engine.leaderTime.seconds < 0.2 })
     }
 
-    // 10
     func testNudgeRateClamped() {
         configure(1)
         engine.nudgeRate(1.25)
@@ -303,7 +290,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(engine.currentRate, 0.25, accuracy: 0.001)
     }
 
-    // 11
     func testPublicScrubAlignsAllPlayers() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -320,7 +306,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertEqual(a, b, accuracy: 0.15)
     }
 
-    // 12
     func testClearReleasesPlayers() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -329,7 +314,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNil(engine.player(forSlot: 1))
     }
 
-    // 13
     func testJoinNewSlotWhenReady() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -338,7 +322,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertTrue(engine.isPlaying)
     }
 
-    // 14
     @MainActor
     func testAutoReplaceEndToEnd() {
         let library = VideoLibrary()
@@ -360,7 +343,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNotNil(library.slots[1])
     }
 
-    // 23
     func testManualMasterRejectsMissingSlot() {
         configure(2)
         engine.setManualMaster(9)
@@ -368,7 +350,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNil(engine.manualReferenceSlot)
     }
 
-    // 24
     func testReferenceModeResetClearsManualMaster() {
         configure(2)
         engine.setManualMaster(1)
@@ -379,7 +360,6 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNil(engine.manualReferenceSlot)
     }
 
-    // 25
     func testPositionPersistenceRoundTrip() {
         let url = URL(fileURLWithPath: "/tmp/trisync-position-\(UUID().uuidString).mov")
         let first = SyncEngine()
@@ -411,7 +391,6 @@ final class CachesTests: XCTestCase {
         super.tearDown()
     }
 
-    // 15
     func testMetadataCacheRoundTrip() {
         let metadata = VideoMetadata(duration: 12.5, width: 1920, height: 1080, frameRate: 30)
         MetadataCache.shared.set(metadata, for: videoURL)
@@ -426,22 +405,22 @@ final class CachesTests: XCTestCase {
         XCTAssertEqual(MetadataCache.shared.get(for: videoURL)?.duration ?? .nan, 12.5, accuracy: 0.001)
     }
 
-    // 16
     func testThumbnailCachePersistsToDisk() async {
-        XCTAssertNotNil(await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait))
+        let first = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
+        XCTAssertNotNil(first)
         let digest = SHA256.hash(data: Data(videoURL.path.utf8))
             .map { String(format: "%02x", $0) }.prefix(16).joined()
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         let file = base.appendingPathComponent("TriSync/Thumbs/\(digest)_p.jpg")
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
-        XCTAssertNotNil(await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait))
+        let second = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
+        XCTAssertNotNil(second)
     }
 }
 
 // MARK: - Helpers / réglages
 
 final class HelpersTests: XCTestCase {
-    // 17
     func testTimeString() {
         XCTAssertEqual(timeString(CMTime(seconds: 0, preferredTimescale: 600)), "0:00")
         XCTAssertEqual(timeString(CMTime(seconds: 65, preferredTimescale: 600)), "1:05")
@@ -449,7 +428,6 @@ final class HelpersTests: XCTestCase {
         XCTAssertEqual(timeString(.invalid), "0:00")
     }
 
-    // 18
     func testSettingsPersistenceRoundTrip() {
         let keys = [
             "settings.displayMode", "settings.ratioMode", "settings.verticalOffset",
@@ -482,7 +460,6 @@ final class HelpersTests: XCTestCase {
         XCTAssertEqual(reloaded.layoutPreset, .wall32)
     }
 
-    // 19
     func testTargetAspect() {
         let settings = AppSettings()
         let asset = VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))
@@ -492,7 +469,6 @@ final class HelpersTests: XCTestCase {
         XCTAssertEqual(settings.targetAspect(for: asset), 0.75, accuracy: 0.001)
     }
 
-    // 26
     func testValidPresetsBySlotCount() {
         let settings = AppSettings()
         XCTAssertEqual(settings.validPresets(forCount: 1), [.auto])
@@ -502,7 +478,6 @@ final class HelpersTests: XCTestCase {
         XCTAssertTrue(settings.validPresets(forCount: 5).contains(.wall32))
     }
 
-    // 27
     func testCustomWeightClamp() {
         let settings = AppSettings()
         settings.resetCustomWeights()
@@ -513,7 +488,6 @@ final class HelpersTests: XCTestCase {
         settings.resetCustomWeights()
     }
 
-    // 28
     func testAdjustWeightPreservesPairTotal() {
         let settings = AppSettings()
         settings.resetCustomWeights()
@@ -525,7 +499,6 @@ final class HelpersTests: XCTestCase {
         settings.resetCustomWeights()
     }
 
-    // 29
     func testTimeStringRoundsToNearestSecond() {
         XCTAssertEqual(timeString(CMTime(seconds: 59.6, preferredTimescale: 600)), "1:00")
     }
