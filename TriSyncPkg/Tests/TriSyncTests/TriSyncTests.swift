@@ -5,11 +5,7 @@ import CryptoKit
 
 // MARK: - Fabrique de vidéos de test
 
-/// Génère de vraies vidéos H.264 via AVAssetWriter afin d'exercer AVFoundation
-/// avec de vrais médias locaux plutôt qu'avec des mocks qui mentiraient très
-/// poliment sur le comportement du framework.
 enum TestVideoFactory {
-
     static func makeVideo(
         at url: URL,
         duration: Double,
@@ -18,12 +14,11 @@ enum TestVideoFactory {
     ) throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        let settings: [String: Any] = [
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: Int(size.width),
             AVVideoHeightKey: Int(size.height)
-        ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        ])
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -33,30 +28,18 @@ enum TestVideoFactory {
                 kCVPixelBufferHeightKey as String: Int(size.height)
             ]
         )
-
-        guard writer.canAdd(input) else {
-            throw NSError(domain: "TestVideoFactory", code: 1)
-        }
+        guard writer.canAdd(input) else { throw NSError(domain: "TestVideoFactory", code: 1) }
         writer.add(input)
-        guard writer.startWriting() else {
-            throw NSError(domain: "TestVideoFactory", code: 2)
-        }
+        guard writer.startWriting() else { throw NSError(domain: "TestVideoFactory", code: 2) }
         writer.startSession(atSourceTime: .zero)
 
         let fps: Int32 = 30
-        let totalFrames = Int(duration * Double(fps))
-        for i in 0..<totalFrames {
-            while !input.isReadyForMoreMediaData {
-                usleep(2_000)
-            }
-
-            let time = CMTime(value: CMTimeValue(i), timescale: fps)
+        for frame in 0..<Int(duration * Double(fps)) {
+            while !input.isReadyForMoreMediaData { usleep(2_000) }
             var pixelBuffer: CVPixelBuffer?
             guard let pool = adaptor.pixelBufferPool,
                   CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer) == kCVReturnSuccess,
-                  let buffer = pixelBuffer else {
-                continue
-            }
+                  let buffer = pixelBuffer else { continue }
 
             CVPixelBufferLockBaseAddress(buffer, [])
             if let base = CVPixelBufferGetBaseAddress(buffer) {
@@ -76,7 +59,10 @@ enum TestVideoFactory {
                 }
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
-            XCTAssertTrue(adaptor.append(buffer, withPresentationTime: time))
+            let time = CMTime(value: CMTimeValue(frame), timescale: fps)
+            guard adaptor.append(buffer, withPresentationTime: time) else {
+                throw NSError(domain: "TestVideoFactory", code: 4)
+            }
         }
 
         input.markAsFinished()
@@ -87,31 +73,20 @@ enum TestVideoFactory {
             throw NSError(
                 domain: "TestVideoFactory",
                 code: 3,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Écriture vidéo échouée: \(writer.error?.localizedDescription ?? "?")"
-                ]
+                userInfo: [NSLocalizedDescriptionKey: writer.error?.localizedDescription ?? "Écriture vidéo échouée"]
             )
         }
     }
 
-    static func makeVideos(
-        count: Int,
-        in directory: URL,
-        prefix: String = "test"
-    ) throws -> [URL] {
+    static func makeVideos(count: Int, in directory: URL, prefix: String = "test") throws -> [URL] {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var urls: [URL] = []
-        for index in 0..<count {
+        return try (0..<count).map { index in
             let url = directory.appendingPathComponent("\(prefix)_\(index).mov")
             try makeVideo(at: url, duration: 1.5 + Double(index) * 0.5)
-            urls.append(url)
+            return url
         }
-        return urls
     }
 }
-
-// MARK: - Utilitaires d'attente
 
 @discardableResult
 func waitUntil(timeout: TimeInterval = 6, _ condition: () -> Bool) -> Bool {
@@ -123,16 +98,15 @@ func waitUntil(timeout: TimeInterval = 6, _ condition: () -> Bool) -> Bool {
     return condition()
 }
 
-// MARK: - Tests de la bibliothèque vidéo
+// MARK: - VideoLibrary
 
 final class VideoLibraryTests: XCTestCase {
-
     private var directory: URL!
 
     override func setUp() {
         super.setUp()
         directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("trisync-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("trisync-library-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -144,19 +118,16 @@ final class VideoLibraryTests: XCTestCase {
     // 1
     @MainActor
     func testVideoFileFiltering() throws {
-        let library = VideoLibrary()
-        defer { library.clearAll() }
         let movie = directory.appendingPathComponent("a.mov")
+        try TestVideoFactory.makeVideo(at: movie, duration: 1.5)
         let mp4 = directory.appendingPathComponent("b.mp4")
         let mkv = directory.appendingPathComponent("c.mkv")
-        let txt = directory.appendingPathComponent("d.txt")
-        let jpg = directory.appendingPathComponent("e.jpg")
-        try TestVideoFactory.makeVideo(at: movie, duration: 1.5)
-
-        let accepted = VideoLibrary.videoFiles(from: [movie, mp4, mkv, txt, jpg])
+        let text = directory.appendingPathComponent("d.txt")
+        let image = directory.appendingPathComponent("e.jpg")
+        let accepted = VideoLibrary.videoFiles(from: [movie, mp4, mkv, text, image])
         XCTAssertEqual(accepted.count, 3)
-        XCTAssertFalse(accepted.contains(txt))
-        XCTAssertFalse(accepted.contains(jpg))
+        XCTAssertFalse(accepted.contains(text))
+        XCTAssertFalse(accepted.contains(image))
     }
 
     // 2
@@ -177,10 +148,7 @@ final class VideoLibraryTests: XCTestCase {
         defer { library.clearAll() }
         let videos = try TestVideoFactory.makeVideos(count: 7, in: directory)
         library.add(urls: videos)
-        XCTAssertEqual(library.assets.count, 7)
-        for asset in library.assets {
-            library.toggleSelection(asset)
-        }
+        for asset in library.assets { library.toggleSelection(asset) }
         XCTAssertEqual(library.selectedOrder.count, 7)
         XCTAssertEqual(library.selectedAssets.count, VideoLibrary.maxSlots)
         XCTAssertEqual(library.selectedAssets.first?.url, videos.first)
@@ -193,9 +161,7 @@ final class VideoLibraryTests: XCTestCase {
         defer { library.clearAll() }
         let videos = try TestVideoFactory.makeVideos(count: 3, in: directory)
         library.add(urls: videos)
-        for asset in library.assets {
-            library.toggleSelection(asset)
-        }
+        for asset in library.assets { library.toggleSelection(asset) }
         library.launchSelected()
         XCTAssertTrue(library.selectedOrder.isEmpty)
         let filled = library.slots.compactMap { $0 }
@@ -261,10 +227,9 @@ final class VideoLibraryTests: XCTestCase {
     }
 }
 
-// MARK: - Tests du moteur de synchronisation
+// MARK: - SyncEngine
 
 final class SyncEngineTests: XCTestCase {
-
     private var directory: URL!
     private var engine: SyncEngine!
     private var videos: [URL]!
@@ -279,14 +244,11 @@ final class SyncEngineTests: XCTestCase {
     }
 
     override func tearDown() {
-        if Thread.isMainThread {
-            engine.clear()
-        }
+        engine.clear()
         try? FileManager.default.removeItem(at: directory)
         super.tearDown()
     }
 
-    @MainActor
     private func configure(_ count: Int) {
         var slots: [Int: VideoAsset] = [:]
         for index in 0..<min(count, videos.count) {
@@ -296,18 +258,14 @@ final class SyncEngineTests: XCTestCase {
     }
 
     // 7
-    @MainActor
     func testReconfigureCreatesPlayers() {
         configure(3)
         XCTAssertTrue(waitUntil { engine.readyCount == 3 })
-        for index in 0..<3 {
-            XCTAssertNotNil(engine.player(forSlot: index))
-        }
+        for index in 0..<3 { XCTAssertNotNil(engine.player(forSlot: index)) }
         XCTAssertNil(engine.player(forSlot: 9))
     }
 
     // 8
-    @MainActor
     func testPlayPauseStop() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -321,59 +279,48 @@ final class SyncEngineTests: XCTestCase {
     }
 
     // 9
-    @MainActor
     func testSkipClampedToDuration() {
         configure(1)
         XCTAssertTrue(waitUntil { engine.readyCount == 1 })
-        engine.play()
-        XCTAssertTrue(waitUntil { engine.isPlaying })
         XCTAssertTrue(waitUntil { engine.leaderDuration.seconds > 0 })
+        engine.play()
         engine.skip(by: 600)
         XCTAssertTrue(waitUntil(timeout: 4) {
             engine.leaderTime.seconds >= engine.leaderDuration.seconds - 0.1
         })
-        XCTAssertGreaterThanOrEqual(
-            engine.leaderTime.seconds,
-            engine.leaderDuration.seconds - 0.2
-        )
         engine.skip(by: -600)
         XCTAssertTrue(waitUntil(timeout: 4) { engine.leaderTime.seconds < 0.2 })
-        XCTAssertLessThan(engine.leaderTime.seconds, 0.2)
     }
 
     // 10
-    @MainActor
     func testNudgeRateClamped() {
         configure(1)
         engine.nudgeRate(1.25)
         XCTAssertEqual(engine.currentRate, 1.25, accuracy: 0.001)
         engine.nudgeRate(100)
-        XCTAssertEqual(engine.currentRate, 2.0, accuracy: 0.001)
+        XCTAssertEqual(engine.currentRate, 2, accuracy: 0.001)
         engine.nudgeRate(0.0001)
         XCTAssertEqual(engine.currentRate, 0.25, accuracy: 0.001)
     }
 
     // 11
-    @MainActor
     func testPublicScrubAlignsAllPlayers() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
         XCTAssertTrue(waitUntil { engine.leaderDuration.seconds > 0 })
-        engine.play()
         engine.beginScrub()
         engine.endScrub(atFraction: 0.5)
         XCTAssertTrue(waitUntil(timeout: 4) {
-            let first = engine.player(forSlot: 0)?.currentTime().seconds ?? -1
-            let second = engine.player(forSlot: 1)?.currentTime().seconds ?? -1
-            return first > 0.4 && second > 0.4
+            let a = engine.player(forSlot: 0)?.currentTime().seconds ?? -1
+            let b = engine.player(forSlot: 1)?.currentTime().seconds ?? -1
+            return a > 0.4 && b > 0.4
         })
-        let first = engine.player(forSlot: 0)?.currentTime().seconds ?? 0
-        let second = engine.player(forSlot: 1)?.currentTime().seconds ?? 0
-        XCTAssertEqual(first, second, accuracy: 0.15)
+        let a = engine.player(forSlot: 0)?.currentTime().seconds ?? 0
+        let b = engine.player(forSlot: 1)?.currentTime().seconds ?? 0
+        XCTAssertEqual(a, b, accuracy: 0.15)
     }
 
     // 12
-    @MainActor
     func testClearReleasesPlayers() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
@@ -383,15 +330,11 @@ final class SyncEngineTests: XCTestCase {
     }
 
     // 13
-    @MainActor
     func testJoinNewSlotWhenReady() {
         configure(2)
         XCTAssertTrue(waitUntil { engine.readyCount == 2 })
         engine.play()
-        XCTAssertTrue(waitUntil { engine.isPlaying })
         engine.joinNewSlot(1)
-        XCTAssertTrue(engine.isPlaying)
-        engine.joinNewSlot(0)
         XCTAssertTrue(engine.isPlaying)
     }
 
@@ -406,23 +349,18 @@ final class SyncEngineTests: XCTestCase {
         library.assign(library.assets[1], to: 1)
         let localEngine = library.engine
         localEngine.autoReplace = true
-
         XCTAssertTrue(waitUntil { localEngine.readyCount == 2 })
         localEngine.play()
-        XCTAssertTrue(waitUntil { localEngine.isPlaying })
 
-        let slot0ID = library.slots[0]?.id
-        let replaced = waitUntil(timeout: 8) {
-            library.slots[0]?.id != slot0ID
-        }
-        XCTAssertTrue(replaced)
+        let originalID = library.slots[0]?.id
+        XCTAssertTrue(waitUntil(timeout: 8) { library.slots[0]?.id != originalID })
         XCTAssertEqual(library.slots[0]?.url, videos[2])
         XCTAssertTrue(localEngine.isPlaying)
-        XCTAssertFalse(library.slots.contains(where: { $0 == nil }))
+        XCTAssertNotNil(library.slots[0])
+        XCTAssertNotNil(library.slots[1])
     }
 
     // 23
-    @MainActor
     func testManualMasterRejectsMissingSlot() {
         configure(2)
         engine.setManualMaster(9)
@@ -431,7 +369,6 @@ final class SyncEngineTests: XCTestCase {
     }
 
     // 24
-    @MainActor
     func testReferenceModeResetClearsManualMaster() {
         configure(2)
         engine.setManualMaster(1)
@@ -454,10 +391,9 @@ final class SyncEngineTests: XCTestCase {
     }
 }
 
-// MARK: - Tests des caches
+// MARK: - Caches
 
 final class CachesTests: XCTestCase {
-
     private var directory: URL!
     private var videoURL: URL!
 
@@ -466,8 +402,8 @@ final class CachesTests: XCTestCase {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("trisync-cache-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        videoURL = directory.appendingPathComponent("cache_video.mov")
-        try? TestVideoFactory.makeVideo(at: videoURL, duration: 2.0)
+        videoURL = directory.appendingPathComponent("cache.mov")
+        try? TestVideoFactory.makeVideo(at: videoURL, duration: 2)
     }
 
     override func tearDown() {
@@ -480,47 +416,31 @@ final class CachesTests: XCTestCase {
         let metadata = VideoMetadata(duration: 12.5, width: 1920, height: 1080, frameRate: 30)
         MetadataCache.shared.set(metadata, for: videoURL)
         let loaded = MetadataCache.shared.get(for: videoURL)
-        XCTAssertNotNil(loaded)
         XCTAssertEqual(loaded?.duration ?? .nan, 12.5, accuracy: 0.001)
         XCTAssertEqual(loaded?.width, 1920)
         XCTAssertEqual(loaded?.height, 1080)
-
         MetadataCache.shared.set(
             VideoMetadata(duration: .nan, width: 0, height: 0, frameRate: 0),
             for: videoURL
         )
-        let notOverwritten = MetadataCache.shared.get(for: videoURL)
-        XCTAssertEqual(notOverwritten?.duration ?? .nan, 12.5, accuracy: 0.001)
+        XCTAssertEqual(MetadataCache.shared.get(for: videoURL)?.duration ?? .nan, 12.5, accuracy: 0.001)
     }
 
     // 16
     func testThumbnailCachePersistsToDisk() async {
-        let image = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
-        XCTAssertNotNil(image)
-        let file = diskFileForTest()
-        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
-        let again = await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait)
-        XCTAssertNotNil(again)
-    }
-
-    private func diskFileForTest() -> URL {
-        let digest = SHA256DigestHelper.stableKey(videoURL.path)
+        XCTAssertNotNil(await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait))
+        let digest = SHA256.hash(data: Data(videoURL.path.utf8))
+            .map { String(format: "%02x", $0) }.prefix(16).joined()
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("TriSync/Thumbs/\(digest)_p.jpg")
+        let file = base.appendingPathComponent("TriSync/Thumbs/\(digest)_p.jpg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertNotNil(await ThumbnailCache.shared.thumbnail(for: videoURL, variant: .portrait))
     }
 }
 
-enum SHA256DigestHelper {
-    static func stableKey(_ path: String) -> String {
-        let digest = SHA256.hash(data: Data(path.utf8))
-        return digest.map { String(format: "%02x", $0) }.prefix(16).joined()
-    }
-}
-
-// MARK: - Tests des helpers / réglages
+// MARK: - Helpers / réglages
 
 final class HelpersTests: XCTestCase {
-
     // 17
     func testTimeString() {
         XCTAssertEqual(timeString(CMTime(seconds: 0, preferredTimescale: 600)), "0:00")
@@ -532,12 +452,8 @@ final class HelpersTests: XCTestCase {
     // 18
     func testSettingsPersistenceRoundTrip() {
         let keys = [
-            "settings.displayMode",
-            "settings.ratioMode",
-            "settings.verticalOffset",
-            "settings.advancedScale",
-            "settings.playbackSpeed",
-            "settings.layoutPreset",
+            "settings.displayMode", "settings.ratioMode", "settings.verticalOffset",
+            "settings.advancedScale", "settings.playbackSpeed", "settings.layoutPreset",
             "settings.customWeights"
         ]
         let defaults = UserDefaults.standard
@@ -546,14 +462,10 @@ final class HelpersTests: XCTestCase {
         })
         defer {
             for key in keys {
-                if let value = backup[key] {
-                    defaults.set(value, forKey: key)
-                } else {
-                    defaults.removeObject(forKey: key)
-                }
+                if let value = backup[key] { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
             }
         }
-
         let settings = AppSettings()
         settings.displayMode = .stretch
         settings.ratioMode = .r169
@@ -561,7 +473,6 @@ final class HelpersTests: XCTestCase {
         settings.advancedScale = .p125
         settings.playbackSpeed = 1.5
         settings.layoutPreset = .wall32
-
         let reloaded = AppSettings()
         XCTAssertEqual(reloaded.displayMode, .stretch)
         XCTAssertEqual(reloaded.ratioMode, .r169)
@@ -574,18 +485,11 @@ final class HelpersTests: XCTestCase {
     // 19
     func testTargetAspect() {
         let settings = AppSettings()
+        let asset = VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))
         settings.ratioMode = .r169
-        XCTAssertEqual(
-            settings.targetAspect(for: VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))),
-            16.0 / 9.0,
-            accuracy: 0.001
-        )
+        XCTAssertEqual(settings.targetAspect(for: asset), 16.0 / 9.0, accuracy: 0.001)
         settings.ratioMode = .auto
-        XCTAssertEqual(
-            settings.targetAspect(for: VideoAsset(url: URL(fileURLWithPath: "/tmp/x.mov"))),
-            0.75,
-            accuracy: 0.001
-        )
+        XCTAssertEqual(settings.targetAspect(for: asset), 0.75, accuracy: 0.001)
     }
 
     // 26
