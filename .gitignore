@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Build SwiftPM
+.build/
+build/
+DerivedData/
+.swiftpm/
+
+# Binaires et bundles
+*.app
+SelfTest/runner
+Branding/make_icon
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+
+# Rapports de crash
+*.ips
